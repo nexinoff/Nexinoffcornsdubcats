@@ -1,3 +1,4 @@
+
 """
 Вся обработка видео: crop → ASR → перевод → TTS → баннер.
 Держим отдельно от bot.py, чтобы можно было гонять и тестировать
@@ -95,23 +96,26 @@ def synthesize_ru(text: str, out_mp3: Path):
         return
 
     if FISH_API_KEY:
-        resp = requests.post(
-            "https://api.fish.audio/v1/tts",
-            headers={
-                "Authorization": f"Bearer {FISH_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "text": text,
-                "reference_id": FISH_VOICE_ID,
-                "format": "mp3",
-                "model": "s2.1-pro-free",
-            },
-            timeout=120,
-        )
-        resp.raise_for_status()
-        out_mp3.write_bytes(resp.content)
-        return
+        try:
+            resp = requests.post(
+                "https://api.fish.audio/v1/tts",
+                headers={
+                    "Authorization": f"Bearer {FISH_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "text": text,
+                    "reference_id": FISH_VOICE_ID,
+                    "format": "mp3",
+                    "model": "s2.1-pro-free",
+                },
+                timeout=120,
+            )
+            resp.raise_for_status()
+            out_mp3.write_bytes(resp.content)
+            return
+        except Exception:
+            pass  # fish не дал (402 и прочее) — уходим на бесплатный gTTS
 
     tts = gTTS(text=text, lang="ru")
     tts.save(str(out_mp3))
