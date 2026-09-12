@@ -18,7 +18,7 @@ import static_ffmpeg
 static_ffmpeg.add_paths()
 
 from faster_whisper import WhisperModel
-from deep_translator import GoogleTranslator, MyMemoryTranslator
+from deep_translator import GoogleTranslator, MyMemoryTranslator, LingvaTranslator
 from gtts import gTTS
 
 FISH_API_KEY = os.environ.get("FISH_API_KEY")
@@ -142,19 +142,37 @@ def transcribe_zh(video_path: Path) -> str:
     return _clean_hallucination(text)
 
 
+def _google_gtx(chunk: str) -> str:
+    """Прямой эндпоинт Google, который редко банят на серверных IP."""
+    try:
+        r = requests.get(
+            "https://translate.googleapis.com/translate_a/single",
+            params={"client": "gtx", "sl": "zh-CN", "tl": "ru", "dt": "t", "q": chunk},
+            timeout=30,
+        )
+        r.raise_for_status()
+        data = r.json()
+        return "".join(p[0] for p in data[0] if p and p[0])
+    except Exception:
+        return ""
+
+
 def _translate_chunk(chunk: str) -> str:
-    try:
-        r = GoogleTranslator(source="zh-CN", target="ru").translate(chunk)
-        if r:
-            return r
-    except Exception:
-        pass
-    try:
-        r = MyMemoryTranslator(source="zh-CN", target="ru").translate(chunk)
-        if r:
-            return r
-    except Exception:
-        pass
+    r = _google_gtx(chunk)
+    if r:
+        return r
+    engines = (
+        lambda: GoogleTranslator(source="zh-CN", target="ru").translate(chunk),
+        lambda: LingvaTranslator(source="zh", target="ru").translate(chunk),
+        lambda: MyMemoryTranslator(source="zh-CN", target="ru").translate(chunk),
+    )
+    for eng in engines:
+        try:
+            r = eng()
+            if r:
+                return r
+        except Exception:
+            continue
     return ""
 
 
