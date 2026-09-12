@@ -96,16 +96,44 @@ def crop_to_9x16(src: Path, dst: Path):
     )
 
 
+def _clean_hallucination(text: str, limit: int = 1000) -> str:
+    """Режет висперовую бурмалду: лимит длины и детектор зацикленных повторов."""
+    if not text:
+        return ""
+    if len(text) > limit:
+        text = text[:limit]
+    chunk = text[:20]
+    if chunk and text.count(chunk) > 5:
+        return ""
+    return text
+
+
 def transcribe_zh(video_path: Path) -> str:
     model = _get_whisper()
-    segments, _info = model.transcribe(str(video_path), language="zh")
-    return "".join(seg.text for seg in segments).strip()
+    segments, _info = model.transcribe(
+        str(video_path),
+        language="zh",
+        condition_on_previous_text=False,
+        temperature=0.0,
+        compression_ratio_threshold=2.4,
+        log_prob_threshold=-1.0,
+    )
+    text = "".join(seg.text for seg in segments).strip()
+    return _clean_hallucination(text)
 
 
 def translate_zh_to_ru(text: str) -> str:
     if not text:
         return ""
-    return GoogleTranslator(source="zh-CN", target="ru").translate(text)
+    chunks = [text[i:i + 900] for i in range(0, len(text), 900)]
+    tr = GoogleTranslator(source="zh-CN", target="ru")
+    parts = []
+    for ch in chunks:
+        try:
+            parts.append(tr.translate(ch) or "")
+        except Exception:
+            parts.append("")
+    return " ".join(p for p in parts if p).strip()
 
 
 def synthesize_ru(text: str, out_mp3: Path):
