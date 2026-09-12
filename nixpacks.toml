@@ -1,0 +1,2 @@
+[phases.setup]
+aptPkgs = ["ffmpeg", "pkg-config", "libavformat-dev", "libavcodec-dev", "libavdevice-dev", "libavutil-dev", "libavfilter-dev", "libswscale-dev", "libswresample-dev"]
