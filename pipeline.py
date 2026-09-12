@@ -1,4 +1,3 @@
-
 """
 Вся обработка видео: crop → ASR → перевод → TTS → баннер.
 Держим отдельно от bot.py, чтобы можно было гонять и тестировать
@@ -11,6 +10,7 @@ import subprocess
 import json
 import sys
 import os
+import re
 from pathlib import Path
 
 import requests
@@ -23,6 +23,7 @@ from gtts import gTTS
 
 FISH_API_KEY = os.environ.get("FISH_API_KEY")
 FISH_VOICE_ID = os.environ.get("FISH_VOICE_ID")
+EDGE_VOICE = os.environ.get("EDGE_VOICE", "ru-RU-DmitryNeural")
 
 _whisper_model = None
 
@@ -53,19 +54,39 @@ def _ffprobe_dims(path: Path) -> tuple[int, int]:
     return int(s["width"]), int(s["height"])
 
 
+def _detect_crop(src: Path):
+    """Ищет чёрные полосы и возвращает строку crop=W:H:X:Y или None."""
+    out = subprocess.run(
+        ["ffmpeg", "-i", str(src), "-vf", "cropdetect=24:2:0",
+         "-frames:v", "50", "-f", "null", "-"],
+        capture_output=True, text=True,
+    )
+    crops = re.findall(r"crop=(\d+:\d+:\d+:\d+)", out.stderr)
+    return crops[-1] if crops else None
+
+
 def crop_to_9x16(src: Path, dst: Path):
-    """Если видео не 9:16 — добавляет блюр-подложку по бокам/сверху-снизу."""
+    """Режет чёрные полосы и приводит к 9:16 без растягивания."""
     w, h = _ffprobe_dims(src)
     target_ratio = 9 / 16
-    if abs((w / h) - target_ratio) < 0.01:
+
+    pre = ""
+    c = _detect_crop(src)
+    if c:
+        cw, ch, cx, cy = (int(x) for x in c.split(":"))
+        if cw * ch < 0.9 * w * h:
+            pre = f"crop={c},"
+
+    if not pre and abs((w / h) - target_ratio) < 0.01:
         subprocess.run(["ffmpeg", "-y", "-i", str(src), "-c", "copy", str(dst)], check=True)
         return
 
     filt = (
-        "[0:v]split=2[bg][fg];"
-        "[bg]scale=270:480,gblur=sigma=12,scale=1080:1920[blurred];"
-        "[fg]scale=1080:-2[fg_scaled];"
-        "[blurred][fg_scaled]overlay=(W-w)/2:(H-h)/2[out]"
+        f"[0:v]{pre}split=2[bg][fg];"
+        "[bg]scale=540:960:force_original_aspect_ratio=increase,crop=540:960,"
+        "gblur=sigma=10,scale=1080:1920[blurred];"
+        "[fg]scale=1080:1920:force_original_aspect_ratio=decrease[fgs];"
+        "[blurred][fgs]overlay=(W-w)/2:(H-h)/2[out]"
     )
     subprocess.run(
         ["ffmpeg", "-y", "-i", str(src), "-filter_complex", filt,
@@ -115,7 +136,17 @@ def synthesize_ru(text: str, out_mp3: Path):
             out_mp3.write_bytes(resp.content)
             return
         except Exception:
-            pass  # fish не дал (402 и прочее) — уходим на бесплатный gTTS
+            pass  # fish не дал — уходим на edge-tts
+
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "edge_tts", "--voice", EDGE_VOICE,
+             "--text", text, "--write-media", str(out_mp3)],
+            check=True, timeout=120,
+        )
+        return
+    except Exception:
+        pass  # edge не дал — последний шанс gTTS
 
     tts = gTTS(text=text, lang="ru")
     tts.save(str(out_mp3))
