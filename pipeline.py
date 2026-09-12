@@ -13,21 +13,46 @@ import os
 import re
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 import requests
-import static_ffmpeg
-static_ffmpeg.add_paths()
+
+try:
+    import static_ffmpeg
+    static_ffmpeg.add_paths()
+except Exception as _e:
+    print("static_ffmpeg init failed:", _e)
 
 from faster_whisper import WhisperModel
-from deep_translator import GoogleTranslator, MyMemoryTranslator
-from gtts import gTTS
+
+try:
+    from deep_translator import GoogleTranslator
+except Exception:
+    GoogleTranslator = None
+try:
+    from deep_translator import MyMemoryTranslator
+except Exception:
+    MyMemoryTranslator = None
+try:
+    from gtts import gTTS
+except Exception:
+    gTTS = None
 
 FISH_API_KEY = os.environ.get("FISH_API_KEY")
 FISH_VOICE_ID = os.environ.get("FISH_VOICE_ID")
 EDGE_VOICE = os.environ.get("EDGE_VOICE", "ru-RU-DmitryNeural")
 
+UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
+
 _whisper_model = None
 _edge_token_cache = {"tok": "", "exp": 0.0}
+_eng_errors = []
+
+
+def _log_err(name, e):
+    code = getattr(getattr(e, "response", None), "status_code", None)
+    _eng_errors.append(f"{name}:{code or type(e).__name__}")
 
 
 def _get_whisper():
@@ -82,7 +107,6 @@ def crop_to_9x16(src: Path, dst: Path):
         else:
             cw, ch = w, h
 
-    # куда ляжет контент в кадре 720x1280 — от этого считаем плашку субтитров
     r = min(720 / cw, 1280 / ch)
     fg_h = int(ch * r) // 2 * 2
     oy = (1280 - fg_h) // 2
@@ -148,7 +172,7 @@ def _edge_token() -> str:
     now = time.time()
     if _edge_token_cache["tok"] and now < _edge_token_cache["exp"]:
         return _edge_token_cache["tok"]
-    r = requests.get("https://edge.microsoft.com/translate/auth", timeout=30)
+    r = requests.get("https://edge.microsoft.com/translate/auth", headers=UA, timeout=30)
     r.raise_for_status()
     tok = r.text.strip()
     _edge_token_cache["tok"] = tok
@@ -157,64 +181,106 @@ def _edge_token() -> str:
 
 
 def _edge_translate(chunk: str) -> str:
-    """Бесплатный переводчик Microsoft Edge: токен без ключа, серверные IP не банит."""
+    """Бесплатный переводчик Microsoft Edge: токен без ключа."""
     try:
         tok = _edge_token()
         r = requests.post(
             "https://api-edge.cognitive.microsofttranslator.com/translate",
             params={"api-version": "3.0", "from": "zh-Hans", "to": "ru"},
-            headers={"Authorization": f"Bearer {tok}",
+            headers={**UA, "Authorization": f"Bearer {tok}",
                      "Content-Type": "application/json"},
             json=[{"Text": chunk}],
             timeout=60,
         )
         r.raise_for_status()
-        data = r.json()
-        return data[0]["translations"][0]["text"]
-    except Exception:
+        return r.json()[0]["translations"][0]["text"]
+    except Exception as e:
+        _log_err("edge", e)
         return ""
 
 
-def _google_gtx(chunk: str) -> str:
-    """Прямой эндпоинт Google, который редко банят на серверных IP."""
+def _gtx(chunk: str, client: str) -> str:
+    """Прямой эндпоинт Google с разным client-ом."""
     try:
         r = requests.get(
             "https://translate.googleapis.com/translate_a/single",
-            params={"client": "gtx", "sl": "zh-CN", "tl": "ru", "dt": "t", "q": chunk},
-            timeout=30,
+            params={"client": client, "sl": "zh-CN", "tl": "ru", "dt": "t", "q": chunk},
+            headers=UA, timeout=30,
         )
         r.raise_for_status()
         data = r.json()
         return "".join(p[0] for p in data[0] if p and p[0])
-    except Exception:
+    except Exception as e:
+        _log_err(f"gtx-{client}", e)
+        return ""
+
+
+LINGVA_HOSTS = ["lingva.ml", "lingva.garudalinux.org", "lingva.lunar.icu"]
+
+
+def _lingva(chunk: str) -> str:
+    """Lingva-инстансы напрямую, без библиотек."""
+    for host in LINGVA_HOSTS:
+        try:
+            r = requests.get(f"https://{host}/api/v1/zh/ru/{quote(chunk)}",
+                             headers=UA, timeout=30)
+            r.raise_for_status()
+            t = r.json().get("translation")
+            if t:
+                return t
+        except Exception as e:
+            _log_err(f"lingva", e)
+    return ""
+
+
+def _dt_google(chunk: str) -> str:
+    if GoogleTranslator is None:
+        return ""
+    try:
+        return GoogleTranslator(source="zh-CN", target="ru").translate(chunk) or ""
+    except Exception as e:
+        _log_err("dt-google", e)
+        return ""
+
+
+def _dt_mymemory(chunk: str) -> str:
+    if MyMemoryTranslator is None:
+        return ""
+    try:
+        return MyMemoryTranslator(source="zh-CN", target="ru").translate(chunk) or ""
+    except Exception as e:
+        _log_err("mymemory", e)
         return ""
 
 
 def _translate_chunk(chunk: str) -> str:
     engines = (
-        lambda: _edge_translate(chunk),
-        lambda: _google_gtx(chunk),
-        lambda: GoogleTranslator(source="zh-CN", target="ru").translate(chunk),
-        lambda: MyMemoryTranslator(source="zh-CN", target="ru").translate(chunk),
+        _edge_translate,
+        lambda c: _gtx(c, "gtx"),
+        lambda c: _gtx(c, "android"),
+        _lingva,
+        _dt_google,
+        _dt_mymemory,
     )
     for eng in engines:
         try:
-            r = eng()
+            r = eng(chunk)
             if r:
                 return r
-        except Exception:
-            continue
+        except Exception as e:
+            _log_err("wrap", e)
     return ""
 
 
 def translate_zh_to_ru(text: str) -> str:
     if not text:
         return ""
+    _eng_errors.clear()
     chunks = [text[i:i + 900] for i in range(0, len(text), 900)]
     parts = [_translate_chunk(ch) for ch in chunks]
     out = " ".join(p for p in parts if p).strip()
     if not out:
-        raise RuntimeError("Перевод не удался ни одним движком, текста нет")
+        raise RuntimeError("Перевод не удался, коды движков: " + "; ".join(_eng_errors[:8]))
     return out
 
 
@@ -230,10 +296,8 @@ def synthesize_ru(text: str, out_mp3: Path):
         try:
             resp = requests.post(
                 "https://api.fish.audio/v1/tts",
-                headers={
-                    "Authorization": f"Bearer {FISH_API_KEY}",
-                    "Content-Type": "application/json",
-                },
+                headers={**UA, "Authorization": f"Bearer {FISH_API_KEY}",
+                         "Content-Type": "application/json"},
                 json={
                     "text": text,
                     "reference_id": FISH_VOICE_ID,
@@ -258,8 +322,12 @@ def synthesize_ru(text: str, out_mp3: Path):
     except Exception:
         pass  # edge не дал — последний шанс gTTS
 
-    tts = gTTS(text=text, lang="ru")
-    tts.save(str(out_mp3))
+    if gTTS is not None:
+        tts = gTTS(text=text, lang="ru")
+        tts.save(str(out_mp3))
+        return
+
+    raise RuntimeError("Ни один TTS не смог озвучить текст")
 
 
 def mux_new_audio(video_path: Path, audio_path: Path, out_path: Path):
