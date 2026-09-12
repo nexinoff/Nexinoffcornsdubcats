@@ -264,3 +264,5 @@ def synthesize_ru(text: str, out_mp3: Path):
 
     tts = gTTS(text=text, lang="ru")
     tts.save(str(out_mp3))
+import static_ffmpeg
+static_ffmpeg.add_paths()
