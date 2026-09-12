@@ -231,8 +231,8 @@ if __name__ == "__main__":
 import os
 import requests
 
-ELEVENLABS_KEY = os.environ.get("ELEVENLABS_KEY")
-ELEVEN_VOICE_ID = os.environ.get("ELEVEN_VOICE_ID", "ВСТАВЬ_СВОЙ_VOICE_ID")
+FISH_API_KEY = os.environ.get("FISH_API_KEY")
+FISH_VOICE_ID = os.environ.get("FISH_VOICE_ID")
 
 
 def synthesize_ru(text: str, out_mp3: Path):
@@ -243,15 +243,18 @@ def synthesize_ru(text: str, out_mp3: Path):
         )
         return
 
-    if ELEVENLABS_KEY:
+    if FISH_API_KEY:
         resp = requests.post(
-            f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE_ID}",
-            headers={"xi-api-key": ELEVENLABS_KEY,
-                     "Content-Type": "application/json"},
+            "https://api.fish.audio/v1/tts",
+            headers={
+                "Authorization": f"Bearer {FISH_API_KEY}",
+                "Content-Type": "application/json",
+            },
             json={
                 "text": text,
-                "model_id": "eleven_multilingual_v2",
-                "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+                "reference_id": FISH_VOICE_ID,
+                "format": "mp3",
+                "model": "s2.1-pro-free",
             },
             timeout=120,
         )
