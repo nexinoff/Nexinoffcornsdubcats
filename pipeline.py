@@ -4,6 +4,9 @@
 из командной строки без Telegram:
 
     python pipeline.py source.mp4 output.mp4
+
+ASR: если заданы WHISPER_CPP и WHISPER_CPP_MODEL — whisper.cpp (Termux/телефон),
+иначе faster-whisper (сервер).
 """
 
 import subprocess
@@ -12,18 +15,23 @@ import sys
 import os
 import re
 import time
+import shutil
 from pathlib import Path
 from urllib.parse import quote
 
 import requests
 
-try:
-    import static_ffmpeg
-    static_ffmpeg.add_paths()
-except Exception as _e:
-    print("static_ffmpeg init failed:", _e)
+if shutil.which("ffmpeg") is None:
+    try:
+        import static_ffmpeg
+        static_ffmpeg.add_paths()
+    except Exception as _e:
+        print("static_ffmpeg init failed:", _e)
 
-from faster_whisper import WhisperModel
+try:
+    from faster_whisper import WhisperModel
+except Exception:
+    WhisperModel = None
 
 try:
     from deep_translator import GoogleTranslator
@@ -42,6 +50,8 @@ FISH_API_KEY = os.environ.get("FISH_API_KEY")
 FISH_VOICE_ID = os.environ.get("FISH_VOICE_ID")
 EDGE_VOICE = os.environ.get("EDGE_VOICE", "ru-RU-DmitryNeural")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
+WHISPER_CPP = os.environ.get("WHISPER_CPP")
+WHISPER_CPP_MODEL = os.environ.get("WHISPER_CPP_MODEL")
 SUBTITLE_BLUR = os.environ.get("SUBTITLE_BLUR", "1") != "0"
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -59,9 +69,14 @@ def _log_err(name, e):
 
 def _get_whisper():
     global _whisper_model
-    if _whisper_model is None:
+    if _whisper_model is None and WhisperModel is not None:
         _whisper_model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
     return _whisper_model
+
+
+def _cpp_ready() -> bool:
+    return bool(WHISPER_CPP and WHISPER_CPP_MODEL
+                and Path(WHISPER_CPP).exists() and Path(WHISPER_CPP_MODEL).exists())
 
 
 def _ffprobe_duration(path: Path) -> float:
@@ -156,8 +171,33 @@ def _clean_hallucination(text: str, limit: int = 1200) -> str:
     return text
 
 
-def transcribe_segments(video_path: Path):
-    """Возвращает список (start, end, text), склеенный в куски под озвучку."""
+def _transcribe_cpp(video_path: Path):
+    """whisper.cpp на телефоне: wav 16k → JSON с таймкодами."""
+    work = video_path.parent
+    wav = work / "asr.wav"
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", str(video_path), "-ar", "16000", "-ac", "1",
+         "-c:a", "pcm_s16le", str(wav)],
+        capture_output=True, check=True,
+    )
+    base = work / "asr"
+    subprocess.run(
+        [WHISPER_CPP, "-m", WHISPER_CPP_MODEL, "-f", str(wav),
+         "-l", "zh", "-oj", "-of", str(base), "-t", "4"],
+        capture_output=True, check=True,
+    )
+    data = json.loads((work / "asr.json").read_text())
+    segs = []
+    for item in data.get("transcription", []):
+        t = (item.get("text") or "").strip()
+        if not t:
+            continue
+        off = item.get("offsets", {})
+        segs.append((off.get("from", 0) / 1000.0, off.get("to", 0) / 1000.0, t))
+    return segs
+
+
+def _transcribe_fw(video_path: Path):
     model = _get_whisper()
     segments, _info = model.transcribe(
         str(video_path),
@@ -167,23 +207,34 @@ def transcribe_segments(video_path: Path):
         compression_ratio_threshold=2.4,
         log_prob_threshold=-1.0,
     )
+    return [(s.start, s.end, (s.text or "").strip())
+            for s in segments if (s.text or "").strip()]
+
+
+def _chunk_segments(segs):
     chunks = []
     cur = None
-    for seg in segments:
-        t = (seg.text or "").strip()
-        if not t:
-            continue
+    for st, en, t in segs:
         if cur is None:
-            cur = [seg.start, seg.end, t]
-        elif len(cur[2]) + len(t) <= 220 and (seg.end - cur[0]) <= 12:
-            cur[1] = seg.end
+            cur = [st, en, t]
+        elif len(cur[2]) + len(t) <= 220 and (en - cur[0]) <= 12:
+            cur[1] = en
             cur[2] += t
         else:
             chunks.append(tuple(cur))
-            cur = [seg.start, seg.end, t]
+            cur = [st, en, t]
     if cur:
         chunks.append(tuple(cur))
     return chunks
+
+
+def transcribe_segments(video_path: Path):
+    """Возвращает список (start, end, text), склеенный в куски под озвучку."""
+    if _cpp_ready():
+        segs = _transcribe_cpp(video_path)
+    else:
+        segs = _transcribe_fw(video_path)
+    return _chunk_segments(segs)
 
 
 def _edge_token() -> str:
@@ -237,7 +288,7 @@ LINGVA_HOSTS = ["lingva.ml", "lingva.garudalinux.org", "lingva.lunar.icu"]
 
 
 def _lingva(chunk: str) -> str:
-    """Lingva-инстансы напрямую, без библиотек."""
+    """Lingva-инстансы напрямую через HTTP, без библиотек."""
     for host in LINGVA_HOSTS:
         try:
             r = requests.get(f"https://{host}/api/v1/zh/ru/{quote(chunk)}",
