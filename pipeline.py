@@ -94,7 +94,7 @@ def _detect_crop(src: Path):
 
 
 def crop_to_9x16(src: Path, dst: Path):
-    """9:16 (720x1280), блюр-фон, и блюр-плашка там где субтитры (низ контента)."""
+    """9:16 (720x1280), блюр-фон, и блюр-полоска поверх субтитров из фона."""
     w, h = _ffprobe_dims(src)
     target_ratio = 9 / 16
 
@@ -110,28 +110,32 @@ def crop_to_9x16(src: Path, dst: Path):
 
     r = min(720 / cw, 1280 / ch)
     fg_h = int(ch * r) // 2 * 2
+    oy = (1280 - fg_h) // 2
     yb = int(fg_h * 0.80)
     hb = fg_h - yb
+    hb = hb // 2 * 2
     if hb < 8:
-        yb, hb = max(0, fg_h - 8), min(8, fg_h)
+        hb = 8
+        yb = max(0, fg_h - hb)
+    Y = oy + yb
 
-    if SUBTITLE_BLUR:
-        sub_chain = (
-            f"[fgs0]split=2[fa][fb];"
-            f"[fb]crop=720:{hb}:0:{yb},boxblur=24:2[fbbl];"
-            f"[fa][fbbl]overlay=0:{yb}[fgs];"
-        )
-    else:
-        sub_chain = "[fgs0]null[fgs];"
-
-    filt = (
+    head = (
         f"[0:v]{pre}split=2[bg][fg];"
         "[bg]scale=360:640:force_original_aspect_ratio=increase,crop=360:640,"
         "gblur=sigma=18,scale=720:1280[blurred];"
-        "[fg]scale=720:1280:force_original_aspect_ratio=decrease[fgs0];"
-        + sub_chain +
-        "[blurred][fgs]overlay=(W-w)/2:(H-h)/2[out]"
+        "[fg]scale=720:1280:force_original_aspect_ratio=decrease[fgs];"
     )
+    if SUBTITLE_BLUR:
+        filt = (
+            head +
+            "[blurred]split=2[blA][blB];"
+            f"[blB]crop=720:{hb}:0:{Y}[strip];"
+            "[blA][fgs]overlay=(W-w)/2:(H-h)/2[comp];"
+            f"[comp][strip]overlay=0:{Y}[out]"
+        )
+    else:
+        filt = head + "[blurred][fgs]overlay=(W-w)/2:(H-h)/2[out]"
+
     subprocess.run(
         ["ffmpeg", "-y", "-i", str(src), "-filter_complex", filt,
          "-map", "[out]", "-map", "0:a", "-c:v", "libx264", "-preset", "veryfast",
