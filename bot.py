@@ -7,7 +7,8 @@ Telegram-бот: перегон китайских вирусных клипов
 2. Приводит видео к 9:16 (блюр-подложка по бокам, если исходник 16:9)
 3. Распознаёт китайскую речь (faster-whisper, работает бесплатно и локально)
 4. Переводит текст на русский (Google Translate через deep-translator, бесплатно)
-5. Озвучивает перевод русским TTS (Silero — бесплатно и офлайн, ключи не нужны)
+5. Озвучивает перевод: Fish Audio (если есть ключ), иначе Edge TTS (Microsoft,
+   бесплатно и без ключей), иначе gTTS
 6. Склеивает результат: новое видео + новая аудиодорожка
 7. Врезает твой баннер (banners/banner.mp4) в середину ролика
    (если ролик длиннее 60 сек — вставляет баннер в середину КАЖДОЙ минуты)
@@ -18,8 +19,9 @@ Telegram-бот: перегон китайских вирусных клипов
 Переменные окружения (задаются в Railway → Variables):
     BOT_TOKEN        — токен от @BotFather (обязательно)
     OWNER_CHAT_ID    — твой telegram chat id, бот отвечает только тебе (опционально)
-    ELEVENLABS_KEY   — если хочешь озвучку получше через ElevenLabs (опционально,
-                        без него используется бесплатный Silero TTS)
+    FISH_API_KEY     — ключ Fish Audio для озвучки клоном (опционально)
+    FISH_VOICE_ID    — id голоса в Fish Audio (опционально)
+    EDGE_VOICE       — голос Edge TTS, по умолчанию ru-RU-DmitryNeural (опционально)
 """
 
 import os
@@ -106,13 +108,25 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         await status_msg.edit_text("Готово, заливаю обратно…")
-        caption = f"🇨🇳 {zh_text[:200]}\n\n🇷🇺 {ru_text[:200]}" if zh_text else None
-        await update.message.reply_video(video=open(out_path, "rb"), caption=caption)
-        await status_msg.delete()
+        caption = f"🇨 {zh_text[:200]}\n\n🇷 {ru_text[:200]}" if zh_text else None
+        try:
+            with open(out_path, "rb") as f:
+                await update.message.reply_video(video=f, caption=caption)
+            await status_msg.delete()
+        except Exception as e:
+            log.exception("upload failed")
+            await status_msg.edit_text(f"Загрузка не удалась: {e}")
 
 
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .read_timeout(300)
+        .write_timeout(300)
+        .media_write_timeout(900)
+        .build()
+    )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.CaptionRegex(r"^/banner") & (filters.VIDEO | filters.Document.VIDEO), set_banner))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
