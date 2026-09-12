@@ -18,7 +18,7 @@ import static_ffmpeg
 static_ffmpeg.add_paths()
 
 from faster_whisper import WhisperModel
-from deep_translator import GoogleTranslator
+from deep_translator import GoogleTranslator, MyMemoryTranslator
 from gtts import gTTS
 
 FISH_API_KEY = os.environ.get("FISH_API_KEY")
@@ -66,21 +66,35 @@ def _detect_crop(src: Path):
 
 
 def crop_to_9x16(src: Path, dst: Path):
-    """Режет чёрные полосы и приводит к 9:16 (720x1280) без растягивания."""
+    """Режет чёрные полосы, приводит к 9:16 (720x1280) и замазывает субтитры."""
     w, h = _ffprobe_dims(src)
     target_ratio = 9 / 16
 
     pre = ""
+    cw, ch = w, h
     c = _detect_crop(src)
     if c:
         cw, ch, cx, cy = (int(x) for x in c.split(":"))
         if cw * ch < 0.9 * w * h:
             pre = f"crop={c},"
+        else:
+            cw, ch = w, h
+
+    # куда ляжет контент в кадре 720x1280 — от этого считаем плашку субтитров
+    r = min(720 / cw, 1280 / ch)
+    fg_h = int(ch * r) // 2 * 2
+    oy = (1280 - fg_h) // 2
+    y0 = oy + int(fg_h * 0.78)
+    h0 = fg_h - int(fg_h * 0.78)
+    if h0 < 8:
+        y0, h0 = 1272, 8
+    box = f"drawbox=x=0:y={y0}:w=720:h={h0}:color=black@1:t=fill"
 
     if not pre and abs((w / h) - target_ratio) < 0.01:
         subprocess.run(
             ["ffmpeg", "-y", "-i", str(src),
-             "-vf", "scale=720:1280", "-c:v", "libx264", "-preset", "veryfast",
+             "-vf", f"scale=720:1280,{box}",
+             "-c:v", "libx264", "-preset", "veryfast",
              "-crf", "28", "-threads", "2", "-c:a", "aac", str(dst)],
             check=True,
         )
@@ -91,7 +105,8 @@ def crop_to_9x16(src: Path, dst: Path):
         "[bg]scale=360:640:force_original_aspect_ratio=increase,crop=360:640,"
         "gblur=sigma=8,scale=720:1280[blurred];"
         "[fg]scale=720:1280:force_original_aspect_ratio=decrease[fgs];"
-        "[blurred][fgs]overlay=(W-w)/2:(H-h)/2[out]"
+        f"[blurred][fgs]overlay=(W-w)/2:(H-h)/2[ov];"
+        f"[ov]{box}[out]"
     )
     subprocess.run(
         ["ffmpeg", "-y", "-i", str(src), "-filter_complex", filt,
@@ -127,18 +142,31 @@ def transcribe_zh(video_path: Path) -> str:
     return _clean_hallucination(text)
 
 
+def _translate_chunk(chunk: str) -> str:
+    try:
+        r = GoogleTranslator(source="zh-CN", target="ru").translate(chunk)
+        if r:
+            return r
+    except Exception:
+        pass
+    try:
+        r = MyMemoryTranslator(source="zh-CN", target="ru").translate(chunk)
+        if r:
+            return r
+    except Exception:
+        pass
+    return ""
+
+
 def translate_zh_to_ru(text: str) -> str:
     if not text:
         return ""
     chunks = [text[i:i + 900] for i in range(0, len(text), 900)]
-    tr = GoogleTranslator(source="zh-CN", target="ru")
-    parts = []
-    for ch in chunks:
-        try:
-            parts.append(tr.translate(ch) or "")
-        except Exception:
-            parts.append("")
-    return " ".join(p for p in parts if p).strip()
+    parts = [_translate_chunk(ch) for ch in chunks]
+    out = " ".join(p for p in parts if p).strip()
+    if not out:
+        raise RuntimeError("Перевод не удался ни одним движком, текста нет")
+    return out
 
 
 def synthesize_ru(text: str, out_mp3: Path):
