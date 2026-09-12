@@ -66,7 +66,7 @@ def _detect_crop(src: Path):
 
 
 def crop_to_9x16(src: Path, dst: Path):
-    """Режет чёрные полосы и приводит к 9:16 без растягивания."""
+    """Режет чёрные полосы и приводит к 9:16 (720x1280) без растягивания."""
     w, h = _ffprobe_dims(src)
     target_ratio = 9 / 16
 
@@ -78,20 +78,25 @@ def crop_to_9x16(src: Path, dst: Path):
             pre = f"crop={c},"
 
     if not pre and abs((w / h) - target_ratio) < 0.01:
-        subprocess.run(["ffmpeg", "-y", "-i", str(src), "-c", "copy", str(dst)], check=True)
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(src),
+             "-vf", "scale=720:1280", "-c:v", "libx264", "-preset", "veryfast",
+             "-crf", "28", "-threads", "2", "-c:a", "aac", str(dst)],
+            check=True,
+        )
         return
 
     filt = (
         f"[0:v]{pre}split=2[bg][fg];"
-        "[bg]scale=540:960:force_original_aspect_ratio=increase,crop=540:960,"
-        "gblur=sigma=10,scale=1080:1920[blurred];"
-        "[fg]scale=1080:1920:force_original_aspect_ratio=decrease[fgs];"
+        "[bg]scale=360:640:force_original_aspect_ratio=increase,crop=360:640,"
+        "gblur=sigma=8,scale=720:1280[blurred];"
+        "[fg]scale=720:1280:force_original_aspect_ratio=decrease[fgs];"
         "[blurred][fgs]overlay=(W-w)/2:(H-h)/2[out]"
     )
     subprocess.run(
         ["ffmpeg", "-y", "-i", str(src), "-filter_complex", filt,
          "-map", "[out]", "-map", "0:a", "-c:v", "libx264", "-preset", "veryfast",
-         "-crf", "22", "-threads", "2", "-c:a", "aac", str(dst)],
+         "-crf", "28", "-threads", "2", "-c:a", "aac", str(dst)],
         check=True,
     )
 
@@ -219,8 +224,8 @@ def insert_banner(video_path: Path, banner_path: Path, out_path: Path,
     for i, start in enumerate(insert_times, start=1):
         video_chains.append(
             f"[{i}:v]chromakey={chroma_color}:{similarity}:{blend},"
-            f"scale=1080:1920:force_original_aspect_ratio=increase,"
-            f"crop=1080:1920,"
+            f"scale=720:1280:force_original_aspect_ratio=increase,"
+            f"crop=720:1280,"
             f"setpts=PTS+{start}/TB[bnr{i}]"
         )
 
@@ -259,7 +264,7 @@ def insert_banner(video_path: Path, banner_path: Path, out_path: Path,
     subprocess.run(
         ["ffmpeg", "-y", *inputs, "-filter_complex", filter_complex,
          "-map", "[vout]", "-map", "[aout]",
-         "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-threads", "2",
+         "-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-threads", "2",
          "-c:a", "aac", str(out_path)],
         check=True,
     )
