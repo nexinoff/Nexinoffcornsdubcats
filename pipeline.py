@@ -228,3 +228,36 @@ if __name__ == "__main__":
     zh, ru = process_video(src, out, banner_path=None, progress_cb=print)
     print("ZH:", zh)
     print("RU:", ru)
+import os
+import requests
+
+ELEVENLABS_KEY = os.environ.get("ELEVENLABS_KEY")
+ELEVEN_VOICE_ID = os.environ.get("ELEVEN_VOICE_ID", "ВСТАВЬ_СВОЙ_VOICE_ID")
+
+
+def synthesize_ru(text: str, out_mp3: Path):
+    if not text:
+        subprocess.run(
+            ["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+             "-t", "3", str(out_mp3)], check=True,
+        )
+        return
+
+    if ELEVENLABS_KEY:
+        resp = requests.post(
+            f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE_ID}",
+            headers={"xi-api-key": ELEVENLABS_KEY,
+                     "Content-Type": "application/json"},
+            json={
+                "text": text,
+                "model_id": "eleven_multilingual_v2",
+                "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+            },
+            timeout=120,
+        )
+        resp.raise_for_status()
+        out_mp3.write_bytes(resp.content)
+        return
+
+    tts = gTTS(text=text, lang="ru")
+    tts.save(str(out_mp3))
