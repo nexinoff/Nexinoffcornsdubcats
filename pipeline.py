@@ -18,7 +18,7 @@ import static_ffmpeg
 static_ffmpeg.add_paths()
 
 from faster_whisper import WhisperModel
-from deep_translator import GoogleTranslator, MyMemoryTranslator, LingvaTranslator
+from deep_translator import GoogleTranslator, MyMemoryTranslator
 from gtts import gTTS
 
 FISH_API_KEY = os.environ.get("FISH_API_KEY")
@@ -163,7 +163,6 @@ def _translate_chunk(chunk: str) -> str:
         return r
     engines = (
         lambda: GoogleTranslator(source="zh-CN", target="ru").translate(chunk),
-        lambda: LingvaTranslator(source="zh", target="ru").translate(chunk),
         lambda: MyMemoryTranslator(source="zh-CN", target="ru").translate(chunk),
     )
     for eng in engines:
