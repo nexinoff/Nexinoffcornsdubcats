@@ -1,5 +1,5 @@
 """
-Вся обработка видео: crop → ASR → перевод → TTS → баннер.
+Вся обработка видео: crop → ASR → перевод → TTS по таймкодам → баннер.
 Держим отдельно от bot.py, чтобы можно было гонять и тестировать
 из командной строки без Telegram:
 
@@ -41,6 +41,8 @@ except Exception:
 FISH_API_KEY = os.environ.get("FISH_API_KEY")
 FISH_VOICE_ID = os.environ.get("FISH_VOICE_ID")
 EDGE_VOICE = os.environ.get("EDGE_VOICE", "ru-RU-DmitryNeural")
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
+SUBTITLE_BLUR = os.environ.get("SUBTITLE_BLUR", "1") != "0"
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
@@ -58,8 +60,7 @@ def _log_err(name, e):
 def _get_whisper():
     global _whisper_model
     if _whisper_model is None:
-        # "base" — легче по памяти для бесплатного Railway-тира
-        _whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
+        _whisper_model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
     return _whisper_model
 
 
@@ -93,7 +94,7 @@ def _detect_crop(src: Path):
 
 
 def crop_to_9x16(src: Path, dst: Path):
-    """Режет чёрные полосы, приводит к 9:16 (720x1280) и замазывает субтитры."""
+    """9:16 (720x1280), блюр-фон, и блюр-плашка там где субтитры (низ контента)."""
     w, h = _ffprobe_dims(src)
     target_ratio = 9 / 16
 
@@ -109,30 +110,27 @@ def crop_to_9x16(src: Path, dst: Path):
 
     r = min(720 / cw, 1280 / ch)
     fg_h = int(ch * r) // 2 * 2
-    oy = (1280 - fg_h) // 2
-    y0 = oy + int(fg_h * 0.78)
-    h0 = fg_h - int(fg_h * 0.78)
-    if h0 < 8:
-        y0, h0 = 1272, 8
-    box = f"drawbox=x=0:y={y0}:w=720:h={h0}:color=black@1:t=fill"
+    yb = int(fg_h * 0.80)
+    hb = fg_h - yb
+    if hb < 8:
+        yb, hb = max(0, fg_h - 8), min(8, fg_h)
 
-    if not pre and abs((w / h) - target_ratio) < 0.01:
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", str(src),
-             "-vf", f"scale=720:1280,{box}",
-             "-c:v", "libx264", "-preset", "veryfast",
-             "-crf", "28", "-threads", "2", "-c:a", "aac", str(dst)],
-            check=True,
+    if SUBTITLE_BLUR:
+        sub_chain = (
+            f"[fgs0]split=2[fa][fb];"
+            f"[fb]crop=720:{hb}:0:{yb},boxblur=24:2[fbbl];"
+            f"[fa][fbbl]overlay=0:{yb}[fgs];"
         )
-        return
+    else:
+        sub_chain = "[fgs0]null[fgs];"
 
     filt = (
         f"[0:v]{pre}split=2[bg][fg];"
         "[bg]scale=360:640:force_original_aspect_ratio=increase,crop=360:640,"
-        "gblur=sigma=8,scale=720:1280[blurred];"
-        "[fg]scale=720:1280:force_original_aspect_ratio=decrease[fgs];"
-        f"[blurred][fgs]overlay=(W-w)/2:(H-h)/2[ov];"
-        f"[ov]{box}[out]"
+        "gblur=sigma=18,scale=720:1280[blurred];"
+        "[fg]scale=720:1280:force_original_aspect_ratio=decrease[fgs0];"
+        + sub_chain +
+        "[blurred][fgs]overlay=(W-w)/2:(H-h)/2[out]"
     )
     subprocess.run(
         ["ffmpeg", "-y", "-i", str(src), "-filter_complex", filt,
@@ -142,7 +140,7 @@ def crop_to_9x16(src: Path, dst: Path):
     )
 
 
-def _clean_hallucination(text: str, limit: int = 1000) -> str:
+def _clean_hallucination(text: str, limit: int = 1200) -> str:
     """Режет висперовую бурмалду: лимит длины и детектор зацикленных повторов."""
     if not text:
         return ""
@@ -154,7 +152,8 @@ def _clean_hallucination(text: str, limit: int = 1000) -> str:
     return text
 
 
-def transcribe_zh(video_path: Path) -> str:
+def transcribe_segments(video_path: Path):
+    """Возвращает список (start, end, text), склеенный в куски под озвучку."""
     model = _get_whisper()
     segments, _info = model.transcribe(
         str(video_path),
@@ -164,8 +163,23 @@ def transcribe_zh(video_path: Path) -> str:
         compression_ratio_threshold=2.4,
         log_prob_threshold=-1.0,
     )
-    text = "".join(seg.text for seg in segments).strip()
-    return _clean_hallucination(text)
+    chunks = []
+    cur = None
+    for seg in segments:
+        t = (seg.text or "").strip()
+        if not t:
+            continue
+        if cur is None:
+            cur = [seg.start, seg.end, t]
+        elif len(cur[2]) + len(t) <= 220 and (seg.end - cur[0]) <= 12:
+            cur[1] = seg.end
+            cur[2] += t
+        else:
+            chunks.append(tuple(cur))
+            cur = [seg.start, seg.end, t]
+    if cur:
+        chunks.append(tuple(cur))
+    return chunks
 
 
 def _edge_token() -> str:
@@ -229,7 +243,7 @@ def _lingva(chunk: str) -> str:
             if t:
                 return t
         except Exception as e:
-            _log_err(f"lingva", e)
+            _log_err("lingva", e)
     return ""
 
 
@@ -275,23 +289,13 @@ def _translate_chunk(chunk: str) -> str:
 def translate_zh_to_ru(text: str) -> str:
     if not text:
         return ""
-    _eng_errors.clear()
     chunks = [text[i:i + 900] for i in range(0, len(text), 900)]
     parts = [_translate_chunk(ch) for ch in chunks]
-    out = " ".join(p for p in parts if p).strip()
-    if not out:
-        raise RuntimeError("Перевод не удался, коды движков: " + "; ".join(_eng_errors[:8]))
-    return out
+    return " ".join(p for p in parts if p).strip()
 
 
-def synthesize_ru(text: str, out_mp3: Path):
-    if not text:
-        subprocess.run(
-            ["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
-             "-t", "3", str(out_mp3)], check=True,
-        )
-        return
-
+def synthesize_ru(text: str, out_mp3: Path) -> str:
+    """Озвучка: fish → edge-tts → gTTS. Возвращает имя движка."""
     if FISH_API_KEY:
         try:
             resp = requests.post(
@@ -308,7 +312,7 @@ def synthesize_ru(text: str, out_mp3: Path):
             )
             resp.raise_for_status()
             out_mp3.write_bytes(resp.content)
-            return
+            return "fish"
         except Exception:
             pass  # fish не дал — уходим на edge-tts
 
@@ -318,29 +322,39 @@ def synthesize_ru(text: str, out_mp3: Path):
              "--text", text, "--write-media", str(out_mp3)],
             check=True, timeout=120,
         )
-        return
+        return "edge"
     except Exception:
         pass  # edge не дал — последний шанс gTTS
 
     if gTTS is not None:
         tts = gTTS(text=text, lang="ru")
         tts.save(str(out_mp3))
-        return
+        return "gtts"
 
     raise RuntimeError("Ни один TTS не смог озвучить текст")
 
 
-def mux_new_audio(video_path: Path, audio_path: Path, out_path: Path):
-    """Заменяет звук в видео на новую озвучку, растягивая её под длину ролика."""
+def mux_segments(video_path: Path, items, out_path: Path):
+    """Кладёт каждую озвучку в её таймкод, вместо старой сплошной дорожки."""
     video_dur = _ffprobe_duration(video_path)
-    audio_dur = _ffprobe_duration(audio_path)
-    tempo = max(0.5, min(2.0, audio_dur / video_dur)) if video_dur > 0 else 1.0
+    inputs = ["-i", str(video_path)]
+    for _st, p, _tempo in items:
+        inputs += ["-i", str(p)]
+
+    chains = []
+    labels = []
+    for i, (st, _p, tempo) in enumerate(items, start=1):
+        ms = int(st * 1000)
+        lab = f"a{i}"
+        chains.append(f"[{i}:a]atempo={tempo:.3f},adelay={ms}|{ms}[{lab}]")
+        labels.append(f"[{lab}]")
+    mix = f"{''.join(labels)}amix=inputs={len(items)}:normalize=0:duration=longest[aout]"
+    fc = ";".join(chains + [mix])
 
     subprocess.run(
-        ["ffmpeg", "-y", "-i", str(video_path), "-i", str(audio_path),
-         "-filter:a", f"atempo={tempo:.3f},apad",
-         "-map", "0:v", "-map", "1:a",
-         "-c:v", "copy", "-t", str(video_dur), str(out_path)],
+        ["ffmpeg", "-y", *inputs, "-filter_complex", fc,
+         "-map", "0:v", "-map", "[aout]",
+         "-c:v", "copy", "-t", str(video_dur), "-c:a", "aac", str(out_path)],
         check=True,
     )
 
@@ -418,26 +432,41 @@ def insert_banner(video_path: Path, banner_path: Path, out_path: Path,
 def process_video(src_path: Path, out_path: Path, banner_path: Path | None = None,
                    progress_cb=lambda msg: None):
     work = src_path.parent
+    _eng_errors.clear()
 
     cropped = work / "cropped.mp4"
     progress_cb("crop")
     crop_to_9x16(src_path, cropped)
 
     progress_cb("transcribe")
-    zh_text = transcribe_zh(cropped)
-    if not zh_text:
-        raise RuntimeError("Распознавание не дало текста, озвучивать нечего")
+    chunks = transcribe_segments(cropped)
+    zh_full = _clean_hallucination("".join(t for _s, _e, t in chunks))
+    if not zh_full:
+        raise RuntimeError("Распознавание не дало текста или дало бурмалду")
 
-    progress_cb("translate")
-    ru_text = translate_zh_to_ru(zh_text)
+    progress_cb("translate+tts")
+    items = []
+    rus = []
+    engine_used = ""
+    for idx, (st, en, txt) in enumerate(chunks):
+        ru = translate_zh_to_ru(txt)
+        if not ru:
+            continue
+        mp3 = work / f"seg_{idx}.mp3"
+        eng = synthesize_ru(ru, mp3)
+        engine_used = engine_used or eng
+        span = max(1.0, en - st)
+        dur = _ffprobe_duration(mp3)
+        tempo = min(1.8, max(0.9, dur / span))
+        items.append((st, mp3, tempo))
+        rus.append(ru)
 
-    progress_cb("tts")
-    ru_mp3 = work / "ru_voice.mp3"
-    synthesize_ru(ru_text, ru_mp3)
+    if not items:
+        raise RuntimeError("Перевод не удался, коды движков: " + "; ".join(_eng_errors[:8]))
 
     dubbed = work / "dubbed.mp4"
     progress_cb("mux")
-    mux_new_audio(cropped, ru_mp3, dubbed)
+    mux_segments(cropped, items, dubbed)
 
     if banner_path and banner_path.exists():
         progress_cb("banner")
@@ -445,7 +474,8 @@ def process_video(src_path: Path, out_path: Path, banner_path: Path | None = Non
     else:
         dubbed.rename(out_path)
 
-    return zh_text, ru_text
+    ru_full = f"[{engine_used}] " + " ".join(rus)
+    return zh_full, ru_full
 
 
 if __name__ == "__main__":
