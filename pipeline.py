@@ -9,11 +9,19 @@
 import subprocess
 import json
 import sys
+import os
 from pathlib import Path
+
+import requests
+import static_ffmpeg
+static_ffmpeg.add_paths()
 
 from faster_whisper import WhisperModel
 from deep_translator import GoogleTranslator
 from gtts import gTTS
+
+FISH_API_KEY = os.environ.get("FISH_API_KEY")
+FISH_VOICE_ID = os.environ.get("FISH_VOICE_ID")
 
 _whisper_model = None
 
@@ -21,8 +29,8 @@ _whisper_model = None
 def _get_whisper():
     global _whisper_model
     if _whisper_model is None:
-        # "small" — норм баланс скорости/качества для CPU на бесплатном Railway-тире
-        _whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
+        # "base" — легче по памяти для бесплатного Railway-тира
+        _whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
     return _whisper_model
 
 
@@ -49,20 +57,19 @@ def crop_to_9x16(src: Path, dst: Path):
     w, h = _ffprobe_dims(src)
     target_ratio = 9 / 16
     if abs((w / h) - target_ratio) < 0.01:
-        # уже вертикальное — просто копируем
         subprocess.run(["ffmpeg", "-y", "-i", str(src), "-c", "copy", str(dst)], check=True)
         return
 
     filt = (
         "[0:v]split=2[bg][fg];"
-        "[bg]scale=1080:1920,gblur=sigma=30,eq=brightness=-0.05[blurred];"
+        "[bg]scale=270:480,gblur=sigma=12,scale=1080:1920[blurred];"
         "[fg]scale=1080:-2[fg_scaled];"
         "[blurred][fg_scaled]overlay=(W-w)/2:(H-h)/2[out]"
     )
     subprocess.run(
         ["ffmpeg", "-y", "-i", str(src), "-filter_complex", filt,
-         "-map", "[out]", "-map", "0:a", "-c:v", "libx264", "-preset", "fast",
-         "-crf", "20", "-c:a", "aac", str(dst)],
+         "-map", "[out]", "-map", "0:a", "-c:v", "libx264", "-preset", "veryfast",
+         "-crf", "22", "-threads", "2", "-c:a", "aac", str(dst)],
         check=True,
     )
 
@@ -81,12 +88,31 @@ def translate_zh_to_ru(text: str) -> str:
 
 def synthesize_ru(text: str, out_mp3: Path):
     if not text:
-        # тишина, если распознать не получилось
         subprocess.run(
             ["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
              "-t", "3", str(out_mp3)], check=True,
         )
         return
+
+    if FISH_API_KEY:
+        resp = requests.post(
+            "https://api.fish.audio/v1/tts",
+            headers={
+                "Authorization": f"Bearer {FISH_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "text": text,
+                "reference_id": FISH_VOICE_ID,
+                "format": "mp3",
+                "model": "s2.1-pro-free",
+            },
+            timeout=120,
+        )
+        resp.raise_for_status()
+        out_mp3.write_bytes(resp.content)
+        return
+
     tts = gTTS(text=text, lang="ru")
     tts.save(str(out_mp3))
 
@@ -99,9 +125,9 @@ def mux_new_audio(video_path: Path, audio_path: Path, out_path: Path):
 
     subprocess.run(
         ["ffmpeg", "-y", "-i", str(video_path), "-i", str(audio_path),
-         "-filter:a", f"atempo={tempo:.3f}",
+         "-filter:a", f"atempo={tempo:.3f},apad",
          "-map", "0:v", "-map", "1:a",
-         "-c:v", "copy", "-shortest", str(out_path)],
+         "-c:v", "copy", "-t", str(video_dur), str(out_path)],
         check=True,
     )
 
@@ -109,29 +135,15 @@ def mux_new_audio(video_path: Path, audio_path: Path, out_path: Path):
 def insert_banner(video_path: Path, banner_path: Path, out_path: Path,
                    chroma_color: str = "0x00FF00", similarity: float = 0.12,
                    blend: float = 0.08):
-    """
-    Накладывает баннер ПОВЕРХ видео (не встык), убирая зелёный фон (chromakey)
-    и растягивая баннер на весь кадр 1080x1920.
-
-    Если ролик > 60 сек — баннер накладывается в середину каждой минуты
-    (по правилам SkinHouse). Звук базового видео на это время глушится,
-    звук баннера подмешивается вместо него.
-
-    chroma_color / similarity / blend — подстрой под свой конкретный баннер,
-    если ключинг съедает часть картинки или оставляет зелёную окантовку:
-      - similarity выше = вырезает больше оттенков зелёного (но может задеть сам объект)
-      - blend выше = мягче края (меньше "рваного" контура)
-    """
     dur = _ffprobe_duration(video_path)
     banner_dur = _ffprobe_duration(banner_path)
 
-    # точки вставки: середина 0-60с, середина 60-120с, и т.д.
     insert_times = []
     minute_start = 0.0
     while minute_start < dur:
         minute_end = min(minute_start + 60, dur)
         mid = minute_start + (minute_end - minute_start) / 2
-        mid = min(mid, max(0.0, dur - banner_dur))  # чтобы баннер не вылез за конец ролика
+        mid = min(mid, max(0.0, dur - banner_dur))
         insert_times.append(mid)
         minute_start += 60
 
@@ -144,8 +156,6 @@ def insert_banner(video_path: Path, banner_path: Path, out_path: Path,
     for i, start in enumerate(insert_times, start=1):
         video_chains.append(
             f"[{i}:v]chromakey={chroma_color}:{similarity}:{blend},"
-            # increase + crop = баннер растягивается на весь кадр без полей по бокам
-            # (лишнее по краям обрезается, а не остаётся чёрным/прозрачным)
             f"scale=1080:1920:force_original_aspect_ratio=increase,"
             f"crop=1080:1920,"
             f"setpts=PTS+{start}/TB[bnr{i}]"
@@ -186,8 +196,8 @@ def insert_banner(video_path: Path, banner_path: Path, out_path: Path,
     subprocess.run(
         ["ffmpeg", "-y", *inputs, "-filter_complex", filter_complex,
          "-map", "[vout]", "-map", "[aout]",
-         "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-c:a", "aac",
-         str(out_path)],
+         "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-threads", "2",
+         "-c:a", "aac", str(out_path)],
         check=True,
     )
 
@@ -228,41 +238,3 @@ if __name__ == "__main__":
     zh, ru = process_video(src, out, banner_path=None, progress_cb=print)
     print("ZH:", zh)
     print("RU:", ru)
-import os
-import requests
-
-FISH_API_KEY = os.environ.get("FISH_API_KEY")
-FISH_VOICE_ID = os.environ.get("FISH_VOICE_ID")
-
-
-def synthesize_ru(text: str, out_mp3: Path):
-    if not text:
-        subprocess.run(
-            ["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
-             "-t", "3", str(out_mp3)], check=True,
-        )
-        return
-
-    if FISH_API_KEY:
-        resp = requests.post(
-            "https://api.fish.audio/v1/tts",
-            headers={
-                "Authorization": f"Bearer {FISH_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "text": text,
-                "reference_id": FISH_VOICE_ID,
-                "format": "mp3",
-                "model": "s2.1-pro-free",
-            },
-            timeout=120,
-        )
-        resp.raise_for_status()
-        out_mp3.write_bytes(resp.content)
-        return
-
-    tts = gTTS(text=text, lang="ru")
-    tts.save(str(out_mp3))
-import static_ffmpeg
-static_ffmpeg.add_paths()
