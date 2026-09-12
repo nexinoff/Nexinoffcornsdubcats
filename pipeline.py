@@ -11,6 +11,7 @@ import json
 import sys
 import os
 import re
+import time
 from pathlib import Path
 
 import requests
@@ -26,6 +27,7 @@ FISH_VOICE_ID = os.environ.get("FISH_VOICE_ID")
 EDGE_VOICE = os.environ.get("EDGE_VOICE", "ru-RU-DmitryNeural")
 
 _whisper_model = None
+_edge_token_cache = {"tok": "", "exp": 0.0}
 
 
 def _get_whisper():
@@ -142,6 +144,37 @@ def transcribe_zh(video_path: Path) -> str:
     return _clean_hallucination(text)
 
 
+def _edge_token() -> str:
+    now = time.time()
+    if _edge_token_cache["tok"] and now < _edge_token_cache["exp"]:
+        return _edge_token_cache["tok"]
+    r = requests.get("https://edge.microsoft.com/translate/auth", timeout=30)
+    r.raise_for_status()
+    tok = r.text.strip()
+    _edge_token_cache["tok"] = tok
+    _edge_token_cache["exp"] = now + 300
+    return tok
+
+
+def _edge_translate(chunk: str) -> str:
+    """Бесплатный переводчик Microsoft Edge: токен без ключа, серверные IP не банит."""
+    try:
+        tok = _edge_token()
+        r = requests.post(
+            "https://api-edge.cognitive.microsofttranslator.com/translate",
+            params={"api-version": "3.0", "from": "zh-Hans", "to": "ru"},
+            headers={"Authorization": f"Bearer {tok}",
+                     "Content-Type": "application/json"},
+            json=[{"Text": chunk}],
+            timeout=60,
+        )
+        r.raise_for_status()
+        data = r.json()
+        return data[0]["translations"][0]["text"]
+    except Exception:
+        return ""
+
+
 def _google_gtx(chunk: str) -> str:
     """Прямой эндпоинт Google, который редко банят на серверных IP."""
     try:
@@ -158,10 +191,9 @@ def _google_gtx(chunk: str) -> str:
 
 
 def _translate_chunk(chunk: str) -> str:
-    r = _google_gtx(chunk)
-    if r:
-        return r
     engines = (
+        lambda: _edge_translate(chunk),
+        lambda: _google_gtx(chunk),
         lambda: GoogleTranslator(source="zh-CN", target="ru").translate(chunk),
         lambda: MyMemoryTranslator(source="zh-CN", target="ru").translate(chunk),
     )
@@ -325,6 +357,8 @@ def process_video(src_path: Path, out_path: Path, banner_path: Path | None = Non
 
     progress_cb("transcribe")
     zh_text = transcribe_zh(cropped)
+    if not zh_text:
+        raise RuntimeError("Распознавание не дало текста, озвучивать нечего")
 
     progress_cb("translate")
     ru_text = translate_zh_to_ru(zh_text)
