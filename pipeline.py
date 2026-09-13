@@ -7,8 +7,9 @@
 
 ASR: если есть GROQ_API_KEY — whisper-large-v3-turbo через Groq (телефон не грузится),
 иначе whisper.cpp (Termux) или faster-whisper (сервер).
-Озвучка: ТОЛЬКО edge-tts, с тремя попытками против глюков майкрософта.
-LLM: Groq переписывает перевод под контекст и под длину таймкода.
+Озвучка: ТОЛЬКО edge-tts, с обрезкой краевых пауз и тремя попытками.
+LLM: Groq переписывает перевод под контекст и под длину таймкода,
+а в конце сама дописывает реплику-итог если остаётся тишина.
 Звук: сплошная лента без дыр (склейка GLUE), темп через VOICE_SPEED.
 Фон: BG_MODE=blur (блюр по бокам) или black (чёрные полосы).
 """
@@ -50,13 +51,13 @@ EDGE_VOICE = os.environ.get("EDGE_VOICE", "ru-RU-DmitryNeural")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 WHISPER_CPP = os.environ.get("WHISPER_CPP")
 WHISPER_CPP_MODEL = os.environ.get("WHISPER_CPP_MODEL")
-VOICE_SPEED = float(os.environ.get("VOICE_SPEED", "1.2"))
+VOICE_SPEED = float(os.environ.get("VOICE_SPEED", "1.3"))
 BG_MODE = os.environ.get("BG_MODE", "blur")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "qwen/qwen3.8-27b")
-CHARS_PER_SEC = float(os.environ.get("CHARS_PER_SEC", "12.0"))
+CHARS_PER_SEC = float(os.environ.get("CHARS_PER_SEC", "16.0"))
 MAX_SILENCE = float(os.environ.get("MAX_SILENCE", "0.7"))
-GLUE = float(os.environ.get("GLUE", "0.3"))
+GLUE = float(os.environ.get("GLUE", "0.15"))
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
@@ -181,6 +182,41 @@ def _llm_rephrase(zh: str, ru: str, budget: int) -> str:
     return ru
 
 
+def _llm_outro(zh: str, ru: str, budget: int) -> str:
+    """LLM сама придумывает живую реплику-итог чтобы добить тишину в конце."""
+    if not GROQ_API_KEY:
+        return ""
+    try:
+        r = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}",
+                     "Content-Type": "application/json"},
+            json={
+                "model": GROQ_MODEL,
+                "temperature": 0.7,
+                "max_tokens": 400,
+                "messages": [
+                    {"role": "system", "content":
+                     "Ты закадровый комментатор китайских видео на русском. "
+                     "Пиши живо, по-пацански, с эмоцией, без канцелярита. "
+                     "Верни ТОЛЬКО текст реплики."},
+                    {"role": "user", "content":
+                     f"Контекст видео (zh): {zh[:800]}\nРеплики перевода (ru): {ru[:800]}\n"
+                     f"Придумай ОДНУ итоговую реплику примерно на {budget} символов, "
+                     "которая закрывает видео по смыслу."},
+                ],
+            },
+            timeout=45,
+        )
+        r.raise_for_status()
+        out = r.json()["choices"][0]["message"]["content"].strip()
+        if out:
+            return out
+    except Exception as e:
+        _log_err("groq-outro", e)
+    return ""
+
+
 def _ffprobe_dims(path: Path) -> tuple[int, int]:
     out = subprocess.run(
         ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams",
@@ -297,7 +333,7 @@ def _chunk_segments(segs):
     for st, en, t in segs:
         if cur is None:
             cur = [st, en, t]
-        elif len(cur[2]) + len(t) <= 220 and (en - cur[0]) <= 12:
+        elif len(cur[2]) + len(t) <= 300 and (en - cur[0]) <= 15:
             cur[1] = en
             cur[2] += t
         else:
@@ -437,7 +473,7 @@ def translate_zh_to_ru(text: str) -> str:
 
 
 def synthesize_ru(text: str, out_mp3: Path) -> str:
-    """Озвучка ТОЛЬКО edge-tts, с тремя попытками против глюков майкрософта."""
+    """Озвучка edge-tts + обрезка краевых пауз, три попытки против глюков."""
     last = None
     for attempt in range(3):
         try:
@@ -446,6 +482,15 @@ def synthesize_ru(text: str, out_mp3: Path) -> str:
                  "--text", text, "--write-media", str(out_mp3)],
                 check=True, timeout=120,
             )
+            tmp = out_mp3.with_suffix(".trim.mp3")
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", str(out_mp3), "-af",
+                 "silenceremove=start_periods=1:start_threshold=-45dB,areverse,"
+                 "silenceremove=start_periods=1:start_threshold=-45dB,areverse",
+                 "-c:a", "libmp3lame", "-q:a", "5", str(tmp)],
+                check=True, capture_output=True,
+            )
+            tmp.replace(out_mp3)
             return "edge"
         except Exception as e:
             last = e
@@ -607,6 +652,20 @@ def process_video(src_path: Path, out_path: Path, banner_path: Path | None = Non
     if end_t > video_dur - 0.2:
         k = min(1.35, (end_t - raw[0][0]) / max(1.0, video_dur - 0.2 - raw[0][0]))
         items, end_t = layout(k)
+
+    # если до конца ролика дыра — LLM сама дописывает реплику-итог
+    remaining = video_dur - 0.3 - end_t
+    if remaining > 1.5:
+        budget = max(30, int(remaining * CHARS_PER_SEC / max(1.0, VOICE_SPEED)))
+        outro = _llm_outro(zh_full, " ".join(r[3] for r in raw), budget)
+        if outro and _lat_ratio(outro) <= 0.4:
+            mp3 = work / "seg_outro.mp3"
+            eng = synthesize_ru(outro, mp3)
+            engine_used = engine_used or eng
+            dur = _ffprobe_duration(mp3)
+            tempo = min(2.0, max(0.95, dur / max(1.0, remaining)))
+            items.append((end_t + 0.2, mp3, tempo, dur / tempo))
+            end_t = end_t + 0.2 + dur / tempo
 
     timing = " ".join(f"{s:.1f}+{f:.1f}" for s, _p, _t, f in items)
 
