@@ -1,16 +1,17 @@
 """
-Вся обработка видео: crop → ASR → перевод → TTS по таймкодам → баннер.
+Вся обработка видео: crop → ASR → LLM-редактура → TTS по таймкодам → баннер.
 Держим отдельно от bot.py, чтобы можно было гонять и тестировать
 из командной строки без Telegram:
 
     python pipeline.py source.mp4 output.mp4
 
-ASR: если заданы WHISPER_CPP и WHISPER_CPP_MODEL — whisper.cpp (Termux/телефон),
-иначе faster-whisper (сервер).
-Субтитры НЕ трогаем: видео чистое, блюр только как фон по бокам.
+ASR: если есть GROQ_API_KEY — whisper-large-v3-turbo через Groq (телефон не грузится),
+иначе whisper.cpp (Termux) или faster-whisper (сервер).
 Озвучка: ТОЛЬКО edge-tts, с тремя попытками против глюков майкрософта.
-Голос: базовая скорость VOICE_SPEED (0.85), комфортный коридор темпа без качелей,
-куски с микро-фейдами без щелчков, наложение на соседа исключено.
+LLM: Groq переписывает перевод под контекст и под длину таймкода.
+Тишина: не больше MAX_SILENCE (0.7 сек), длинные дыры схлопываются сдвигом.
+Темп: никогда ниже 0.98 — растягивания слов НЕТ, только ускорение.
+Фон: BG_MODE=blur (блюр по бокам) или black (чёрные полосы).
 """
 
 import subprocess
@@ -50,7 +51,13 @@ EDGE_VOICE = os.environ.get("EDGE_VOICE", "ru-RU-DmitryNeural")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 WHISPER_CPP = os.environ.get("WHISPER_CPP")
 WHISPER_CPP_MODEL = os.environ.get("WHISPER_CPP_MODEL")
-VOICE_SPEED = float(os.environ.get("VOICE_SPEED", "0.85"))
+VOICE_SPEED = float(os.environ.get("VOICE_SPEED", "0.8"))
+BG_MODE = os.environ.get("BG_MODE", "blur")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "qwen/qwen3.8-27b")
+CHARS_PER_SEC = float(os.environ.get("CHARS_PER_SEC", "12.0"))
+MAX_SILENCE = float(os.environ.get("MAX_SILENCE", "0.7"))
+MAX_EARLY = 2.5
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
@@ -86,6 +93,69 @@ def _lat_ratio(t: str) -> float:
     return lat / len(letters)
 
 
+def _transcribe_groq(video_path: Path):
+    """whisper-large-v3-turbo через Groq: телефон только отправляет mp3."""
+    work = video_path.parent
+    mp3 = work / "asr.mp3"
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", str(video_path), "-vn", "-ac", "1", "-ar", "16000",
+         "-c:a", "libmp3lame", "-b:a", "64k", str(mp3)],
+        capture_output=True, check=True,
+    )
+    with open(mp3, "rb") as f:
+        r = requests.post(
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            files={"file": ("asr.mp3", f, "audio/mpeg")},
+            data={"model": "whisper-large-v3-turbo", "language": "zh",
+                  "response_format": "verbose_json",
+                  "timestamp_granularities[]": "segment"},
+            timeout=300,
+        )
+    r.raise_for_status()
+    data = r.json()
+    segs = []
+    for item in data.get("segments", []):
+        t = (item.get("text") or "").strip()
+        if t:
+            segs.append((float(item.get("start", 0)), float(item.get("end", 0)), t))
+    return segs
+
+
+def _llm_rephrase(zh: str, ru: str, budget: int) -> str:
+    """Groq-ллм переписывает черновик живо и укладывает в бюджет символов."""
+    if not GROQ_API_KEY:
+        return ru
+    try:
+        r = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}",
+                     "Content-Type": "application/json"},
+            json={
+                "model": GROQ_MODEL,
+                "temperature": 0.4,
+                "max_tokens": 500,
+                "messages": [
+                    {"role": "system", "content":
+                     "Ты редактор закадрового перевода китайских видео на русский. "
+                     "Пиши живо, разговорно, по-пацански, без канцелярита. "
+                     "Верни ТОЛЬКО текст перевода, без пояснений и кавычек."},
+                    {"role": "user", "content":
+                     f"Оригинал (zh): {zh}\nЧерновик (ru): {ru}\n"
+                     f"Уложись строго в {budget} символов, сохрани смысл и эмоцию."},
+                ],
+            },
+            timeout=45,
+        )
+        r.raise_for_status()
+        out = r.json()["choices"][0]["message"]["content"].strip()
+        if out:
+            return out
+    except Exception as e:
+        _log_err("groq-llm", e)
+    return ru
+
+
 def _ffprobe_duration(path: Path) -> float:
     out = subprocess.run(
         ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(path)],
@@ -116,7 +186,7 @@ def _detect_crop(src: Path):
 
 
 def crop_to_9x16(src: Path, dst: Path):
-    """9:16 (720x1280), блюр-фон по бокам, БЕЗ всяких полос поверх субтитров."""
+    """9:16 (720x1280): BG_MODE=blur — блюр-фон, BG_MODE=black — чёрные полосы."""
     w, h = _ffprobe_dims(src)
 
     pre = ""
@@ -129,16 +199,20 @@ def crop_to_9x16(src: Path, dst: Path):
         else:
             cw, ch = w, h
 
-    r = min(720 / cw, 1280 / ch)
-    fg_h = int(ch * r) // 2 * 2
-
-    filt = (
-        f"[0:v]{pre}split=2[bg][fg];"
-        "[bg]scale=360:640:force_original_aspect_ratio=increase,crop=360:640,"
-        "gblur=sigma=18,scale=720:1280[blurred];"
-        "[fg]scale=720:1280:force_original_aspect_ratio=decrease[fgs];"
-        "[blurred][fgs]overlay=(W-w)/2:(H-h)/2[out]"
-    )
+    if BG_MODE == "black":
+        filt = (
+            f"[0:v]{pre}scale=720:1280:force_original_aspect_ratio=decrease[fgs];"
+            "color=black:720x1280[bgc];"
+            "[bgc][fgs]overlay=(W-w)/2:(H-h)/2[out]"
+        )
+    else:
+        filt = (
+            f"[0:v]{pre}split=2[bg][fg];"
+            "[bg]scale=360:640:force_original_aspect_ratio=increase,crop=360:640,"
+            "gblur=sigma=18,scale=720:1280[blurred];"
+            "[fg]scale=720:1280:force_original_aspect_ratio=decrease[fgs];"
+            "[blurred][fgs]overlay=(W-w)/2:(H-h)/2[out]"
+        )
 
     subprocess.run(
         ["ffmpeg", "-y", "-i", str(src), "-filter_complex", filt,
@@ -218,16 +292,21 @@ def _chunk_segments(segs):
 
 
 def transcribe_segments(video_path: Path):
-    """Возвращает список (start, end, text), склеенный в куски под озвучку."""
+    """ASR по приоритету: Groq large-v3-turbo → whisper.cpp → faster-whisper."""
+    if GROQ_API_KEY:
+        try:
+            segs = _transcribe_groq(video_path)
+            if segs:
+                segs = [s for s in segs if _lat_ratio(s[2]) <= 0.5]
+                return _chunk_segments(segs)
+        except Exception as e:
+            _log_err("groq-asr", e)
     if _cpp_ready():
         segs = _transcribe_cpp(video_path)
     else:
         segs = _transcribe_fw(video_path)
-    # выкидываем английскую бурмалду виспера до перевода
     segs = [s for s in segs if _lat_ratio(s[2]) <= 0.5]
     return _chunk_segments(segs)
-
-
 def _edge_token() -> str:
     now = time.time()
     if _edge_token_cache["tok"] and now < _edge_token_cache["exp"]:
@@ -341,7 +420,7 @@ def translate_zh_to_ru(text: str) -> str:
 
 
 def synthesize_ru(text: str, out_mp3: Path) -> str:
-    """Озвучка ТОЛЬКО edge-tts, но с тремя попытками против глюков майкрософта."""
+    """Озвучка ТОЛЬКО edge-tts, с тремя попытками против глюков майкрософта."""
     last = None
     for attempt in range(3):
         try:
@@ -471,34 +550,36 @@ def process_video(src_path: Path, out_path: Path, banner_path: Path | None = Non
     if not zh_full:
         raise RuntimeError("Распознавание не дало текста или дало бурмалду")
 
-    progress_cb("translate+tts")
+    progress_cb("translate+llm+tts")
     items = []
     rus = []
     engine_used = ""
+    prev_end = 0.0
     for idx, (st, en, txt) in enumerate(chunks):
         ru = translate_zh_to_ru(txt)
         # английский мусор в переводе не озвучиваем
         if not ru or _lat_ratio(ru) > 0.4:
             continue
+        span = max(1.0, en - st)
+        budget = max(20, int(span * CHARS_PER_SEC))
+        # ллм правит текст если он не ложится в таймкод
+        if len(ru) > int(budget * 1.05) or len(ru) < int(budget * 0.75):
+            ru = _llm_rephrase(txt, ru, budget)
         mp3 = work / f"seg_{idx}.mp3"
         eng = synthesize_ru(ru, mp3)
         engine_used = engine_used or eng
-        span = max(1.0, en - st)
         dur = _ffprobe_duration(mp3)
-        fit = dur / span
-        # окно до следующего голоса: тормозить можно только до границы соседа
-        next_st = chunks[idx + 1][0] if idx + 1 < len(chunks) else None
-        room = (next_st - st) - 0.15 if next_st is not None else span + 2.0
-        room = max(room, span * 0.5)
-        tempo_min = dur / room
-        # комфортный коридор: без зомби и без пулемёта
-        lo = VOICE_SPEED * 0.85
-        hi = VOICE_SPEED * 1.35
-        tempo = max(lo, min(fit * VOICE_SPEED, hi))
-        tempo = max(tempo, min(tempo_min, 2.0))
-        tempo = max(0.7, min(2.0, tempo))
+        # растягивания НЕТ: темп никогда ниже 0.98
+        tempo = max(0.98, min(1.75, (dur / span) * VOICE_SPEED))
         fd = dur / tempo
-        items.append((st, mp3, tempo, fd))
+        # тишина не больше MAX_SILENCE: длинную дыру схлопываем сдвигом раньше
+        start = st
+        gap = st - prev_end
+        if gap > MAX_SILENCE:
+            start = max(prev_end + MAX_SILENCE, st - MAX_EARLY)
+        start = max(start, prev_end + 0.05)
+        prev_end = start + fd
+        items.append((start, mp3, tempo, fd))
         rus.append(ru)
 
     if not items:
