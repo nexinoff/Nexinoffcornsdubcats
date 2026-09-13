@@ -8,7 +8,7 @@
 ASR: если заданы WHISPER_CPP и WHISPER_CPP_MODEL — whisper.cpp (Termux/телефон),
 иначе faster-whisper (сервер).
 Субтитры НЕ трогаем: видео чистое, блюр только как фон по бокам.
-Озвучка: ТОЛЬКО edge-tts, без запасных движков.
+Озвучка: ТОЛЬКО edge-tts, с тремя попытками против глюков майкрософта.
 Голос: базовая скорость VOICE_SPEED (0.85), комфортный коридор темпа без качелей,
 куски с микро-фейдами без щелчков, наложение на соседа исключено.
 """
@@ -341,13 +341,20 @@ def translate_zh_to_ru(text: str) -> str:
 
 
 def synthesize_ru(text: str, out_mp3: Path) -> str:
-    """Озвучка ТОЛЬКО edge-tts. Упал — значит упал, видим ошибку сразу."""
-    subprocess.run(
-        [sys.executable, "-m", "edge_tts", "--voice", EDGE_VOICE,
-         "--text", text, "--write-media", str(out_mp3)],
-        check=True, timeout=120,
-    )
-    return "edge"
+    """Озвучка ТОЛЬКО edge-tts, но с тремя попытками против глюков майкрософта."""
+    last = None
+    for attempt in range(3):
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "edge_tts", "--voice", EDGE_VOICE,
+                 "--text", text, "--write-media", str(out_mp3)],
+                check=True, timeout=120,
+            )
+            return "edge"
+        except Exception as e:
+            last = e
+            time.sleep(3 + attempt * 3)
+    raise RuntimeError(f"edge-tts сдох после трёх попыток: {last}")
 
 
 def mux_segments(video_path: Path, items, out_path: Path):
