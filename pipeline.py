@@ -9,11 +9,8 @@ ASR: если есть GROQ_API_KEY — whisper-large-v3-turbo через Groq (
 иначе whisper.cpp (Termux) или faster-whisper (сервер).
 Озвучка: ТОЛЬКО edge-tts, с тремя попытками против глюков майкрософта.
 LLM: Groq переписывает перевод под контекст и под длину таймкода.
-Тишина: не больше MAX_SILENCE (0.7 сек), длинные дыры схлопываются сдвигом.
-Темп: никогда ниже 0.98 — растягивания слов НЕТ, только ускорение.
+Звук: сплошная лента без дыр (склейка GLUE), темп через VOICE_SPEED.
 Фон: BG_MODE=blur (блюр по бокам) или black (чёрные полосы).
-Предохранители: авто-нормализация единиц таймкодов, ограничение дрейфа,
-проверка звуковой дорожки после сведения.
 """
 
 import subprocess
@@ -53,13 +50,13 @@ EDGE_VOICE = os.environ.get("EDGE_VOICE", "ru-RU-DmitryNeural")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 WHISPER_CPP = os.environ.get("WHISPER_CPP")
 WHISPER_CPP_MODEL = os.environ.get("WHISPER_CPP_MODEL")
-VOICE_SPEED = float(os.environ.get("VOICE_SPEED", "0.8"))
+VOICE_SPEED = float(os.environ.get("VOICE_SPEED", "1.2"))
 BG_MODE = os.environ.get("BG_MODE", "blur")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "qwen/qwen3.8-27b")
 CHARS_PER_SEC = float(os.environ.get("CHARS_PER_SEC", "12.0"))
 MAX_SILENCE = float(os.environ.get("MAX_SILENCE", "0.7"))
-MAX_EARLY = 2.5
+GLUE = float(os.environ.get("GLUE", "0.3"))
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
@@ -571,10 +568,8 @@ def process_video(src_path: Path, out_path: Path, banner_path: Path | None = Non
         raise RuntimeError("Распознавание не дало текста или дало бурмалду")
 
     progress_cb("translate+llm+tts")
-    items = []
-    rus = []
+    raw = []
     engine_used = ""
-    prev_end = 0.0
     for idx, (st, en, txt) in enumerate(chunks):
         ru = translate_zh_to_ru(txt)
         # английский мусор в переводе не озвучиваем
@@ -589,22 +584,31 @@ def process_video(src_path: Path, out_path: Path, banner_path: Path | None = Non
         eng = synthesize_ru(ru, mp3)
         engine_used = engine_used or eng
         dur = _ffprobe_duration(mp3)
-        # растягивания НЕТ: темп никогда ниже 0.98
-        tempo = max(0.98, min(1.75, (dur / span) * VOICE_SPEED))
-        fd = dur / tempo
-        # тишина не больше MAX_SILENCE, дрейф не копится: старт не позже st
-        start = st
-        if st - prev_end > MAX_SILENCE:
-            start = max(prev_end + MAX_SILENCE, st - MAX_EARLY)
-        if prev_end - 0.5 > start:
-            start = prev_end - 0.5
-        start = max(start, 0.0)
-        prev_end = start + fd
-        items.append((start, mp3, tempo, fd))
-        rus.append(ru)
+        base = max(0.95, min(1.75, dur / span))
+        tempo = min(2.0, base * VOICE_SPEED)
+        raw.append([st, dur, mp3, ru, tempo])
 
-    if not items:
+    if not raw:
         raise RuntimeError("Перевод не удался, коды движков: " + "; ".join(_eng_errors[:8]))
+
+    video_dur = _ffprobe_duration(cropped)
+
+    def layout(k):
+        """Сплошная лента: склейка GLUE, без дыр и без наложений."""
+        t = raw[0][0]
+        out = []
+        for st, dur, mp3, ru, tempo in raw:
+            fd = dur / (tempo * k)
+            out.append((t, mp3, tempo * k, fd))
+            t += fd + GLUE
+        return out, t
+
+    items, end_t = layout(1.0)
+    if end_t > video_dur - 0.2:
+        k = min(1.35, (end_t - raw[0][0]) / max(1.0, video_dur - 0.2 - raw[0][0]))
+        items, end_t = layout(k)
+
+    timing = " ".join(f"{s:.1f}+{f:.1f}" for s, _p, _t, f in items)
 
     dubbed = work / "dubbed.mp4"
     progress_cb("mux")
@@ -621,7 +625,7 @@ def process_video(src_path: Path, out_path: Path, banner_path: Path | None = Non
     else:
         dubbed.rename(out_path)
 
-    ru_full = f"[{engine_used}] " + " ".join(rus)
+    ru_full = f"[{engine_used}] " + " ".join(r[3] for r in raw) + f" || timing: {timing}"
     return zh_full, ru_full
 
 
