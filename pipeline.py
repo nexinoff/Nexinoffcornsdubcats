@@ -8,8 +8,8 @@
 ASR: если заданы WHISPER_CPP и WHISPER_CPP_MODEL — whisper.cpp (Termux/телефон),
 иначе faster-whisper (сервер).
 Субтитры НЕ трогаем: видео чистое, блюр только как фон по бокам.
-Голос: базовая скорость VOICE_SPEED (0.85), темп куска подгоняется под длину
-китайской фразы, НЕ залезает на соседний кусок и не оставляет дыр тишины.
+Голос: базовая скорость VOICE_SPEED (0.85), комфортный коридор темпа без качелей,
+куски с микро-фейдами без щелчков, наложение на соседа исключено.
 """
 
 import subprocess
@@ -386,18 +386,22 @@ def synthesize_ru(text: str, out_mp3: Path) -> str:
 
 
 def mux_segments(video_path: Path, items, out_path: Path):
-    """Кладёт каждую озвучку в её таймкод, вместо старой сплошной дорожки."""
+    """Кладёт каждую озвучку в её таймкод, с микро-фейдами без щелчков."""
     video_dur = _ffprobe_duration(video_path)
     inputs = ["-i", str(video_path)]
-    for _st, p, _tempo in items:
+    for _st, p, _t, _fd in items:
         inputs += ["-i", str(p)]
 
     chains = []
     labels = []
-    for i, (st, _p, tempo) in enumerate(items, start=1):
+    for i, (st, _p, tempo, fd) in enumerate(items, start=1):
         ms = int(st * 1000)
         lab = f"a{i}"
-        chains.append(f"[{i}:a]atempo={tempo:.3f},adelay={ms}|{ms}[{lab}]")
+        fade_out = max(0.0, fd - 0.08)
+        chains.append(
+            f"[{i}:a]atempo={tempo:.3f},afade=t=in:d=0.06,"
+            f"afade=t=out:d=0.08:st={fade_out:.3f},adelay={ms}|{ms}[{lab}]"
+        )
         labels.append(f"[{lab}]")
     mix = f"{''.join(labels)}amix=inputs={len(items)}:normalize=0:duration=longest[aout]"
     fc = ";".join(chains + [mix])
@@ -515,12 +519,14 @@ def process_video(src_path: Path, out_path: Path, banner_path: Path | None = Non
         room = (next_st - st) - 0.15 if next_st is not None else span + 2.0
         room = max(room, span * 0.5)
         tempo_min = dur / room
-        # потолок: не оставлять дыру тишины больше 0.3 сек
-        cap = dur / max(0.5, span - 0.3)
-        tempo = max(tempo_min, min(fit * VOICE_SPEED, cap))
-        tempo = max(0.7, min(2.0, tempo))
+        # комфортный коридор: без зомби и без пулемёта
+        lo = VOICE_SPEED * 0.85
+        hi = VOICE_SPEED * 1.35
+        tempo = max(lo, min(fit * VOICE_SPEED, hi))
         tempo = max(tempo, min(tempo_min, 2.0))
-        items.append((st, mp3, tempo))
+        tempo = max(0.7, min(2.0, tempo))
+        fd = dur / tempo
+        items.append((st, mp3, tempo, fd))
         rus.append(ru)
 
     if not items:
