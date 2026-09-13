@@ -8,8 +8,8 @@
 ASR: если заданы WHISPER_CPP и WHISPER_CPP_MODEL — whisper.cpp (Termux/телефон),
 иначе faster-whisper (сервер).
 Субтитры НЕ трогаем: видео чистое, блюр только как фон по бокам.
-Голос: базовая скорость VOICE_SPEED (1.05), темп каждого куска подгоняется
-под длину китайской фразы, тишина в конце куска не больше 0.3 сек.
+Голос: базовая скорость VOICE_SPEED (0.85), темп куска подгоняется под длину
+китайской фразы, НЕ залезает на соседний кусок и не оставляет дыр тишины.
 """
 
 import subprocess
@@ -55,7 +55,7 @@ EDGE_VOICE = os.environ.get("EDGE_VOICE", "ru-RU-DmitryNeural")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 WHISPER_CPP = os.environ.get("WHISPER_CPP")
 WHISPER_CPP_MODEL = os.environ.get("WHISPER_CPP_MODEL")
-VOICE_SPEED = float(os.environ.get("VOICE_SPEED", "1.05"))
+VOICE_SPEED = float(os.environ.get("VOICE_SPEED", "0.85"))
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
@@ -510,10 +510,16 @@ def process_video(src_path: Path, out_path: Path, banner_path: Path | None = Non
         span = max(1.0, en - st)
         dur = _ffprobe_duration(mp3)
         fit = dur / span
-        tempo = fit * VOICE_SPEED
-        # голос не должен закончить раньше фразы: тишина не больше 0.3 сек
-        tempo = min(tempo, dur / max(0.5, span - 0.3))
-        tempo = max(0.85, min(1.9, tempo))
+        # окно до следующего голоса: тормозить можно только до границы соседа
+        next_st = chunks[idx + 1][0] if idx + 1 < len(chunks) else None
+        room = (next_st - st) - 0.15 if next_st is not None else span + 2.0
+        room = max(room, span * 0.5)
+        tempo_min = dur / room
+        # потолок: не оставлять дыру тишины больше 0.3 сек
+        cap = dur / max(0.5, span - 0.3)
+        tempo = max(tempo_min, min(fit * VOICE_SPEED, cap))
+        tempo = max(0.7, min(2.0, tempo))
+        tempo = max(tempo, min(tempo_min, 2.0))
         items.append((st, mp3, tempo))
         rus.append(ru)
 
