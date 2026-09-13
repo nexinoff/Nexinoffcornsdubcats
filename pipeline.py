@@ -8,6 +8,7 @@
 ASR: если заданы WHISPER_CPP и WHISPER_CPP_MODEL — whisper.cpp (Termux/телефон),
 иначе faster-whisper (сервер).
 Субтитры НЕ трогаем: видео чистое, блюр только как фон по бокам.
+Озвучка: ТОЛЬКО edge-tts, без запасных движков.
 Голос: базовая скорость VOICE_SPEED (0.85), комфортный коридор темпа без качелей,
 куски с микро-фейдами без щелчков, наложение на соседа исключено.
 """
@@ -44,13 +45,7 @@ try:
     from deep_translator import MyMemoryTranslator
 except Exception:
     MyMemoryTranslator = None
-try:
-    from gtts import gTTS
-except Exception:
-    gTTS = None
 
-FISH_API_KEY = os.environ.get("FISH_API_KEY")
-FISH_VOICE_ID = os.environ.get("FISH_VOICE_ID")
 EDGE_VOICE = os.environ.get("EDGE_VOICE", "ru-RU-DmitryNeural")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 WHISPER_CPP = os.environ.get("WHISPER_CPP")
@@ -346,43 +341,13 @@ def translate_zh_to_ru(text: str) -> str:
 
 
 def synthesize_ru(text: str, out_mp3: Path) -> str:
-    """Озвучка: fish → edge-tts → gTTS. Возвращает имя движка."""
-    if FISH_API_KEY:
-        try:
-            resp = requests.post(
-                "https://api.fish.audio/v1/tts",
-                headers={**UA, "Authorization": f"Bearer {FISH_API_KEY}",
-                         "Content-Type": "application/json"},
-                json={
-                    "text": text,
-                    "reference_id": FISH_VOICE_ID,
-                    "format": "mp3",
-                    "model": "s2.1-pro-free",
-                },
-                timeout=120,
-            )
-            resp.raise_for_status()
-            out_mp3.write_bytes(resp.content)
-            return "fish"
-        except Exception:
-            pass  # fish не дал — уходим на edge-tts
-
-    try:
-        subprocess.run(
-            [sys.executable, "-m", "edge_tts", "--voice", EDGE_VOICE,
-             "--text", text, "--write-media", str(out_mp3)],
-            check=True, timeout=120,
-        )
-        return "edge"
-    except Exception:
-        pass  # edge не дал — последний шанс gTTS
-
-    if gTTS is not None:
-        tts = gTTS(text=text, lang="ru")
-        tts.save(str(out_mp3))
-        return "gtts"
-
-    raise RuntimeError("Ни один TTS не смог озвучить текст")
+    """Озвучка ТОЛЬКО edge-tts. Упал — значит упал, видим ошибку сразу."""
+    subprocess.run(
+        [sys.executable, "-m", "edge_tts", "--voice", EDGE_VOICE,
+         "--text", text, "--write-media", str(out_mp3)],
+        check=True, timeout=120,
+    )
+    return "edge"
 
 
 def mux_segments(video_path: Path, items, out_path: Path):
