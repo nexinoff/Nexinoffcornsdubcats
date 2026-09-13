@@ -12,6 +12,8 @@ LLM: Groq переписывает перевод под контекст и п�
 Тишина: не больше MAX_SILENCE (0.7 сек), длинные дыры схлопываются сдвигом.
 Темп: никогда ниже 0.98 — растягивания слов НЕТ, только ускорение.
 Фон: BG_MODE=blur (блюр по бокам) или black (чёрные полосы).
+Предохранители: авто-нормализация единиц таймкодов, ограничение дрейфа,
+проверка звуковой дорожки после сведения.
 """
 
 import subprocess
@@ -93,6 +95,27 @@ def _lat_ratio(t: str) -> float:
     return lat / len(letters)
 
 
+def _ffprobe_duration(path: Path) -> float:
+    out = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(path)],
+        capture_output=True, text=True, check=True,
+    )
+    return float(json.loads(out.stdout)["format"]["duration"])
+
+
+def _audio_duration(path: Path) -> float:
+    """Длительность звуковой дорожки; 0.0 если дорожки нет вообще."""
+    out = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams",
+         "-select_streams", "a:0", str(path)],
+        capture_output=True, text=True, check=True,
+    )
+    streams = json.loads(out.stdout).get("streams", [])
+    if not streams:
+        return 0.0
+    return float(streams[0].get("duration", 0) or 0)
+
+
 def _transcribe_groq(video_path: Path):
     """whisper-large-v3-turbo через Groq: телефон только отправляет mp3."""
     work = video_path.parent
@@ -119,6 +142,11 @@ def _transcribe_groq(video_path: Path):
         t = (item.get("text") or "").strip()
         if t:
             segs.append((float(item.get("start", 0)), float(item.get("end", 0)), t))
+    # предохранитель: если приехали миллисекунды — нормализуем в секунды
+    if segs:
+        vd = _ffprobe_duration(video_path)
+        if max(e for _s, e, _t in segs) > vd * 2:
+            segs = [(s / 1000.0, e / 1000.0, t) for s, e, t in segs]
     return segs
 
 
@@ -154,14 +182,6 @@ def _llm_rephrase(zh: str, ru: str, budget: int) -> str:
     except Exception as e:
         _log_err("groq-llm", e)
     return ru
-
-
-def _ffprobe_duration(path: Path) -> float:
-    out = subprocess.run(
-        ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(path)],
-        capture_output=True, text=True, check=True,
-    )
-    return float(json.loads(out.stdout)["format"]["duration"])
 
 
 def _ffprobe_dims(path: Path) -> tuple[int, int]:
@@ -437,7 +457,7 @@ def synthesize_ru(text: str, out_mp3: Path) -> str:
 
 
 def mux_segments(video_path: Path, items, out_path: Path):
-    """Кладёт каждую озвучку в её таймкод, с микро-фейдами без щелчков."""
+    """Кладёт каждую озвучку в её таймкод, с микро-фейдами и ресемплом 44.1k."""
     video_dur = _ffprobe_duration(video_path)
     inputs = ["-i", str(video_path)]
     for _st, p, _t, _fd in items:
@@ -450,7 +470,7 @@ def mux_segments(video_path: Path, items, out_path: Path):
         lab = f"a{i}"
         fade_out = max(0.0, fd - 0.08)
         chains.append(
-            f"[{i}:a]atempo={tempo:.3f},afade=t=in:d=0.06,"
+            f"[{i}:a]atempo={tempo:.3f},aresample=44100,afade=t=in:d=0.06,"
             f"afade=t=out:d=0.08:st={fade_out:.3f},adelay={ms}|{ms}[{lab}]"
         )
         labels.append(f"[{lab}]")
@@ -572,12 +592,13 @@ def process_video(src_path: Path, out_path: Path, banner_path: Path | None = Non
         # растягивания НЕТ: темп никогда ниже 0.98
         tempo = max(0.98, min(1.75, (dur / span) * VOICE_SPEED))
         fd = dur / tempo
-        # тишина не больше MAX_SILENCE: длинную дыру схлопываем сдвигом раньше
+        # тишина не больше MAX_SILENCE, дрейф не копится: старт не позже st
         start = st
-        gap = st - prev_end
-        if gap > MAX_SILENCE:
+        if st - prev_end > MAX_SILENCE:
             start = max(prev_end + MAX_SILENCE, st - MAX_EARLY)
-        start = max(start, prev_end + 0.05)
+        if prev_end - 0.5 > start:
+            start = prev_end - 0.5
+        start = max(start, 0.0)
         prev_end = start + fd
         items.append((start, mp3, tempo, fd))
         rus.append(ru)
@@ -588,6 +609,11 @@ def process_video(src_path: Path, out_path: Path, banner_path: Path | None = Non
     dubbed = work / "dubbed.mp4"
     progress_cb("mux")
     mux_segments(cropped, items, dubbed)
+
+    # предохранитель: тихую дорожку не отправляем, орем ошибкой
+    ad = _audio_duration(dubbed)
+    if ad < 2.0:
+        raise RuntimeError(f"mux собрал тихую дорожку ({ad:.1f} c), видос не отправлю")
 
     if banner_path and banner_path.exists():
         progress_cb("banner")
