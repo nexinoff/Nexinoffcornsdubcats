@@ -7,8 +7,7 @@
 
 ASR: если заданы WHISPER_CPP и WHISPER_CPP_MODEL — whisper.cpp (Termux/телефон),
 иначе faster-whisper (сервер).
-Субтитры: детектся динамически по кадрам, блюрится только найденная полоса
-и только в те интервалы, когда субтитры реально на экране.
+Субтитры НЕ трогаем: видео чистое, блюр только как фон по бокам.
 """
 
 import subprocess
@@ -54,7 +53,7 @@ EDGE_VOICE = os.environ.get("EDGE_VOICE", "ru-RU-DmitryNeural")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 WHISPER_CPP = os.environ.get("WHISPER_CPP")
 WHISPER_CPP_MODEL = os.environ.get("WHISPER_CPP_MODEL")
-SUBTITLE_BLUR = os.environ.get("SUBTITLE_BLUR", "1") != "0"
+VOICE_SPEED = float(os.environ.get("VOICE_SPEED", "1.25"))
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
@@ -119,84 +118,9 @@ def _detect_crop(src: Path):
     return crops[-1] if crops else None
 
 
-def _detect_subtitle_band(src: Path, pre: str, fg_h: int, oy: int):
-    """Смотрит кадры раз в секунду и находит полосу и интервалы субтитров."""
-    W, H = 180, 320
-    proc = subprocess.Popen(
-        ["ffmpeg", "-v", "quiet", "-i", str(src),
-         "-vf", f"{pre}fps=1,scale={W}:{H},format=gray",
-         "-f", "rawvideo", "-"],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-    )
-    fb = W * H
-    frames = []
-    while True:
-        buf = proc.stdout.read(fb)
-        if not buf or len(buf) < fb:
-            break
-        frames.append(buf)
-    proc.stdout.close()
-    proc.wait()
-    if not frames:
-        return None, []
-
-    subs = []
-    for buf in frames:
-        has = False
-        y0, y1 = H, -1
-        for y in range(H // 2, H):
-            row = buf[y * W:(y + 1) * W]
-            trans = 0
-            prev = row[0]
-            for x in range(1, W):
-                cur = row[x]
-                if (prev > 180 and cur < 80) or (prev < 80 and cur > 180):
-                    trans += 1
-                prev = cur
-            if trans >= 10:
-                has = True
-                if y < y0:
-                    y0 = y
-                if y > y1:
-                    y1 = y
-        subs.append((has, y0, y1))
-
-    y0s = [a for h, a, b in subs if h and b >= 0]
-    y1s = [b for h, a, b in subs if h and b >= 0]
-    if not y0s:
-        return None, []
-    factor = fg_h / H
-    Y0 = int(oy + min(y0s) * factor) - 6
-    Y1 = int(oy + (max(y1s) + 1) * factor) + 6
-    Y0 = max(int(oy), Y0)
-    Y1 = min(int(oy + fg_h), Y1)
-    if Y1 - Y0 < 8:
-        return None, []
-
-    intervals = []
-    cur = None
-    for i, (h, _a, _b) in enumerate(subs):
-        if h and _b >= 0:
-            if cur is None:
-                cur = [i, i + 1]
-            else:
-                cur[1] = i + 1
-        else:
-            if cur:
-                intervals.append((cur[0], cur[1]))
-                cur = None
-    if cur:
-        intervals.append((cur[0], cur[1]))
-    total = sum(b - a for a, b in intervals)
-    if total >= 0.85 * len(subs) or len(intervals) > 25:
-        intervals = []  # субтитры почти всегда — не дёргаем enable
-    return (Y0, Y1), intervals
-
-
 def crop_to_9x16(src: Path, dst: Path):
-    """9:16 (720x1280), блюр-фон, и ДИНАМИЧЕСКИЙ блюр только по субтитрам."""
+    """9:16 (720x1280), блюр-фон по бокам, БЕЗ всяких полос поверх субтитров."""
     w, h = _ffprobe_dims(src)
-    target_ratio = 9 / 16
 
     pre = ""
     cw, ch = w, h
@@ -210,33 +134,14 @@ def crop_to_9x16(src: Path, dst: Path):
 
     r = min(720 / cw, 1280 / ch)
     fg_h = int(ch * r) // 2 * 2
-    oy = (1280 - fg_h) // 2
 
-    band, intervals = (None, [])
-    if SUBTITLE_BLUR:
-        band, intervals = _detect_subtitle_band(src, pre, fg_h, oy)
-
-    head = (
+    filt = (
         f"[0:v]{pre}split=2[bg][fg];"
         "[bg]scale=360:640:force_original_aspect_ratio=increase,crop=360:640,"
         "gblur=sigma=18,scale=720:1280[blurred];"
         "[fg]scale=720:1280:force_original_aspect_ratio=decrease[fgs];"
+        "[blurred][fgs]overlay=(W-w)/2:(H-h)/2[out]"
     )
-    if band:
-        Y0, Y1 = band
-        hb = Y1 - Y0
-        en = ""
-        if intervals:
-            en = ":enable='" + "+".join(f"between(t,{a},{b})" for a, b in intervals) + "'"
-        filt = (
-            head +
-            "[blurred]split=2[blA][blB];"
-            f"[blB]crop=720:{hb}:0:{Y0}[strip];"
-            "[blA][fgs]overlay=(W-w)/2:(H-h)/2[comp];"
-            f"[comp][strip]overlay=0:{Y0}{en}[out]"
-        )
-    else:
-        filt = head + "[blurred][fgs]overlay=(W-w)/2:(H-h)/2[out]"
 
     subprocess.run(
         ["ffmpeg", "-y", "-i", str(src), "-filter_complex", filt,
@@ -602,7 +507,7 @@ def process_video(src_path: Path, out_path: Path, banner_path: Path | None = Non
         engine_used = engine_used or eng
         span = max(1.0, en - st)
         dur = _ffprobe_duration(mp3)
-        tempo = max(0.8, min(1.8, dur / span) - 0.1)
+        tempo = max(0.8, min(2.0, (dur / span) * VOICE_SPEED))
         items.append((st, mp3, tempo))
         rus.append(ru)
 
